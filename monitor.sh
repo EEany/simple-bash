@@ -34,7 +34,7 @@ PROMETHEUS_DIR="${INSTALL_DIR}/prometheus"
 NODE_EXPORTER_DIR="${INSTALL_DIR}/node_exporter"
 
 # 为中国服务器定义的下载镜像
-GITHUB_MIRROR="https://ghfast.com"
+GITHUB_MIRROR="https://ghfast.top"
 
 # --- 颜色定义 ---
 GREEN='\033[0;32m'
