@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Prometheus & Node Exporter 自动化安装脚本 (v2)
+# Prometheus & Node Exporter 自动化安装脚本 (v4)
 #
 # 功能:
 # 1. 检查并请求 Root 权限.
@@ -87,24 +87,40 @@ download_and_setup() {
     mkdir -p ${INSTALL_DIR}
     cd ${INSTALL_DIR}
 
+    # 定义文件名和原始 GitHub 下载 URL
+    PROMETHEUS_FILENAME="prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz"
+    PROMETHEUS_DL_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${PROMETHEUS_FILENAME}"
+    
+    NODE_EXPORTER_FILENAME="node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
+    NODE_EXPORTER_DL_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_FILENAME}"
+
     # 下载 Prometheus
-    PROMETHEUS_URL="${GITHUB_MIRROR}/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz"
-    log_info "正在从镜像下载 Prometheus..."
-    curl -sLO ${PROMETHEUS_URL}
-    tar xvf prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz > /dev/null
+    log_info "正在从镜像下载 Prometheus (v${PROMETHEUS_VERSION})..."
+    # 使用 -f 选项让 curl 在遇到 HTTP 错误时失败退出
+    # 使用 -o 选项指定输出文件名，避免因 URL 复杂而导致文件名错误
+    if ! curl -sfL "${GITHUB_MIRROR}/${PROMETHEUS_DL_URL}" -o "${PROMETHEUS_FILENAME}"; then
+        log_error "Prometheus 下载失败。请检查网络连接或镜像地址 ${GITHUB_MIRROR} 是否可用。"
+        log_error "您也可以尝试直接从此链接下载: ${PROMETHEUS_DL_URL}"
+        exit 1
+    fi
+    tar xvf ${PROMETHEUS_FILENAME} > /dev/null
     mv prometheus-${PROMETHEUS_VERSION}.${ARCH} prometheus
-    rm prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz
+    rm ${PROMETHEUS_FILENAME}
     log_info "Prometheus 已安装到 ${PROMETHEUS_DIR}"
 
     # 下载 Node Exporter
-    NODE_EXPORTER_URL="${GITHUB_MIRROR}/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
-    log_info "正在从镜像下载 Node Exporter..."
-    curl -sLO ${NODE_EXPORTER_URL}
-    tar xvf node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz > /dev/null
+    log_info "正在从镜像下载 Node Exporter (v${NODE_EXPORTER_VERSION})..."
+    if ! curl -sfL "${GITHUB_MIRROR}/${NODE_EXPORTER_DL_URL}" -o "${NODE_EXPORTER_FILENAME}"; then
+        log_error "Node Exporter 下载失败。请检查网络连接或镜像地址 ${GITHUB_MIRROR} 是否可用。"
+        log_error "您也可以尝试直接从此链接下载: ${NODE_EXPORTER_DL_URL}"
+        exit 1
+    fi
+    tar xvf ${NODE_EXPORTER_FILENAME} > /dev/null
     mv node_exporter-${NODE_EXPORTER_VERSION}.${ARCH} node_exporter
-    rm node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz
+    rm ${NODE_EXPORTER_FILENAME}
     log_info "Node Exporter 已安装到 ${NODE_EXPORTER_DIR}"
 }
+
 
 # 4. 创建 Prometheus 配置文件
 create_prometheus_config() {
@@ -304,7 +320,7 @@ print_report() {
 # --- 主程序 ---
 main() {
     clear
-    echo -e "${GREEN}欢迎使用 Prometheus & Node Exporter 自动化部署工具 v3${NC}"
+    echo -e "${GREEN}欢迎使用 Prometheus & Node Exporter 自动化部署工具 v5${NC}"
     echo -e "----------------------------------------------------"
     check_root
     install_dependencies
