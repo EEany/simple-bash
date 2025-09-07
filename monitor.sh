@@ -1,39 +1,36 @@
 #!/bin/bash
 
 # ==============================================================================
-# Prometheus & Node Exporter 自动化安装脚本 (v4)
+# Prometheus & Node Exporter 自动化安装脚本 (monitor.sh)
 #
 # 功能:
 # 1. 检查并请求 Root 权限.
-# 2. 安装必要的依赖: supervisor, ufw.
-# 3. 使用 ghfast.com 镜像下载最新的 Prometheus 和 Node Exporter.
-# 4. 解压并安装到 /opt/workspace/ 目录下.
-# 5. 创建详细的默认 Prometheus 配置文件.
-# 6. 配置 Supervisor 来监控和管理这两个服务.
-# 7. 智能配置 UFW 防火墙规则 (检测现有状态).
-# 8. 完成后打印总结报告.
+# 2. 自动检测系统发行版 (Debian/Ubuntu/CentOS/RHEL) 和架构 (x86_64/arm64).
+# 3. 创建专用的低权限系统用户 'prometheus' 来运行服务，增强安全性.
+# 4. 安装必要的依赖 (ufw, curl).
+# 5. 从镜像下载 Prometheus 和 Node Exporter，并显示下载进度条.
+# 6. 下载官方 SHA256 校验和文件，并验证软件包完整性.
+# 7. 解压并安装服务.
+# 8. 创建详细的默认 Prometheus 配置文件.
+# 9. 配置 Systemd 来管理这两个服务，实现开机自启.
+# 10. 智能配置 UFW 防火墙规则.
+# 11. 自动安装 starnode 管理工具到 /usr/local/bin，实现全局访问.
+# 12. 完成后打印详细的总结报告.
 #
-# 使用方法:
-# 1. 保存脚本为 setup_monitoring.sh
-# 2. chmod +x setup_monitoring.sh
-# 3. sudo ./setup_monitoring.sh
 # ==============================================================================
 
-# --- 全局变量 ---
-# 使用 set -e 命令，确保脚本在任何命令返回非零退出状态时立即退出
+# --- 脚本设置 ---
+# 在任何命令返回非零退出状态时立即退出
 set -e
+# 在引用未设置的变量时视为错误
+set -u
 
-# 定义软件版本 (可以根据需要更新)
-PROMETHEUS_VERSION="3.5.0"
-NODE_EXPORTER_VERSION="1.9.1"
-ARCH="linux-amd64"
-
-# 定义安装路径
-INSTALL_DIR="/opt/workspace"
-PROMETHEUS_DIR="${INSTALL_DIR}/prometheus"
-NODE_EXPORTER_DIR="${INSTALL_DIR}/node_exporter"
-
-# 为中国服务器定义的下载镜像
+# --- 全局变量 ---
+PROMETHEUS_VERSION="2.53.0"
+NODE_EXPORTER_VERSION="1.8.2"
+INSTALL_BASE_DIR="/opt/prometheus"
+USER="prometheus"
+GROUP="prometheus"
 GITHUB_MIRROR="https://ghfast.top"
 
 # --- 颜色定义 ---
@@ -44,15 +41,8 @@ NC='\033[0m' # No Color
 
 # --- 函数定义 ---
 
-# 打印信息
-log_info() {
-    echo -e "${GREEN}[INFO] $1${NC}"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN] $1${NC}"
-}
-
+log_info() { echo -e "${GREEN}[INFO] $1${NC}"; }
+log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
 log_error() {
     echo -e "${RED}[ERROR] $1${NC}"
     exit 1
@@ -62,217 +52,221 @@ log_error() {
 check_root() {
     log_info "检查 Root 权限..."
     if [ "$(id -u)" != "0" ]; then
-       log_error "此脚本必须使用 root 权限运行。请尝试使用 'sudo ./setup_monitoring.sh'。"
+        log_error "此脚本必须使用 root 权限运行。请尝试使用 'sudo ./monitor.sh'。"
     fi
     log_info "权限检查通过。"
 }
 
-# 2. 安装依赖 (Supervisor, UFW)
+# 2. 检测系统发行版和架构
+detect_distro_and_arch() {
+    log_info "正在检测系统环境..."
+    # 检测架构
+    MACHINE_ARCH=$(uname -m)
+    case "${MACHINE_ARCH}" in
+        x86_64) ARCH="linux-amd64" ;;
+        aarch64) ARCH="linux-arm64" ;;
+        *) log_error "不支持的系统架构: ${MACHINE_ARCH}" ;;
+    esac
+    log_info "检测到系统架构: ${ARCH}"
+
+    # 检测包管理器
+    if command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt-get"
+        INSTALL_CMD="apt-get install -y"
+        UPDATE_CMD="apt-get update"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        INSTALL_CMD="yum install -y"
+        UPDATE_CMD="yum makecache"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        INSTALL_CMD="dnf install -y"
+        UPDATE_CMD="dnf makecache"
+    else
+        log_error "未找到支持的包管理器 (apt-get, yum, or dnf)。"
+    fi
+    log_info "检测到包管理器: ${PKG_MANAGER}"
+}
+
+# 3. 创建专用的服务用户
+create_service_user() {
+    log_info "正在创建专用的系统用户 '${USER}'..."
+    if id -u "${USER}" &>/dev/null; then
+        log_warn "用户 '${USER}' 已存在，跳过创建步骤。"
+    else
+        useradd --system --no-create-home --shell /bin/false "${USER}"
+        log_info "系统用户 '${USER}' 创建成功。"
+    fi
+}
+
+# 4. 安装依赖
 install_dependencies() {
-    log_info "正在更新软件包列表并安装依赖 (supervisor, ufw)..."
-    # 适用于 Debian/Ubuntu 系统
-    apt-get update > /dev/null
-    apt-get install -y supervisor ufw curl > /dev/null
+    log_info "正在更新软件包列表并安装依赖 (ufw, curl)..."
+    ${UPDATE_CMD} > /dev/null
+    ${INSTALL_CMD} ufw curl tar > /dev/null
     log_info "依赖安装完成。"
-    
-    # 启动并启用 supervisor
-    systemctl enable supervisor
-    systemctl start supervisor
-    log_info "Supervisor 已启动并设置为开机自启。"
 }
 
-# 3. 下载并解压 Prometheus 和 Node Exporter
+# 5. 下载、校验并安装
 download_and_setup() {
-    log_info "正在创建安装目录: ${INSTALL_DIR}"
-    mkdir -p ${INSTALL_DIR}
-    cd ${INSTALL_DIR}
+    log_info "正在创建安装目录: ${INSTALL_BASE_DIR}"
+    rm -rf "${INSTALL_BASE_DIR}"
+    mkdir -p "${INSTALL_BASE_DIR}"
+    cd "${INSTALL_BASE_DIR}"
 
-    # 定义文件名和原始 GitHub 下载 URL
-    PROMETHEUS_FILENAME="prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz"
-    PROMETHEUS_DL_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${PROMETHEUS_FILENAME}"
+    # --- 处理 Prometheus ---
+    local PROMETHEUS_FILENAME="prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz"
+    local PROMETHEUS_DL_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${PROMETHEUS_FILENAME}"
+    local SHA256_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/sha256sums.txt"
+
+    log_info "正在下载 Prometheus (v${PROMETHEUS_VERSION})..."
+    curl --progress-bar -fLO "${GITHUB_MIRROR}/${PROMETHEUS_DL_URL}" || log_error "Prometheus 下载失败。"
     
-    NODE_EXPORTER_FILENAME="node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
-    NODE_EXPORTER_DL_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_FILENAME}"
+    log_info "正在下载 SHA256 校验和文件..."
+    curl --progress-bar -fLO "${GITHUB_MIRROR}/${SHA256_URL}" || log_error "SHA256SUM 文件下载失败。"
+    
+    log_info "正在校验 Prometheus 文件完整性..."
+    grep "${PROMETHEUS_FILENAME}" sha256sums.txt | sha256sum -c - || log_error "Prometheus 文件校验失败！文件可能已损坏或被篡改。"
+    
+    log_info "校验成功，正在解压 Prometheus..."
+    tar xzf "${PROMETHEUS_FILENAME}" --strip-components=1 -C "${INSTALL_BASE_DIR}" > /dev/null
+    rm -f "${PROMETHEUS_FILENAME}" sha256sums.txt
+    log_info "Prometheus 已安装到 ${INSTALL_BASE_DIR}"
 
-    # 下载 Prometheus
-    log_info "正在从镜像下载 Prometheus (v${PROMETHEUS_VERSION})..."
-    # 使用 -f 选项让 curl 在遇到 HTTP 错误时失败退出
-    # 使用 -o 选项指定输出文件名，避免因 URL 复杂而导致文件名错误
-    if ! curl -sfL "${GITHUB_MIRROR}/${PROMETHEUS_DL_URL}" -o "${PROMETHEUS_FILENAME}"; then
-        log_error "Prometheus 下载失败。请检查网络连接或镜像地址 ${GITHUB_MIRROR} 是否可用。"
-        log_error "您也可以尝试直接从此链接下载: ${PROMETHEUS_DL_URL}"
-        exit 1
-    fi
-    tar xvf ${PROMETHEUS_FILENAME} > /dev/null
-    mv prometheus-${PROMETHEUS_VERSION}.${ARCH} prometheus
-    rm ${PROMETHEUS_FILENAME}
-    log_info "Prometheus 已安装到 ${PROMETHEUS_DIR}"
+    # --- 处理 Node Exporter ---
+    local NODE_EXPORTER_FILENAME="node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
+    local NODE_EXPORTER_DL_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_FILENAME}"
+    SHA256_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/sha256sums.txt"
+    
+    cd /tmp
+    log_info "正在下载 Node Exporter (v${NODE_EXPORTER_VERSION})..."
+    curl --progress-bar -fLO "${GITHUB_MIRROR}/${NODE_EXPORTER_DL_URL}" || log_error "Node Exporter 下载失败。"
 
-    # 下载 Node Exporter
-    log_info "正在从镜像下载 Node Exporter (v${NODE_EXPORTER_VERSION})..."
-    if ! curl -sfL "${GITHUB_MIRROR}/${NODE_EXPORTER_DL_URL}" -o "${NODE_EXPORTER_FILENAME}"; then
-        log_error "Node Exporter 下载失败。请检查网络连接或镜像地址 ${GITHUB_MIRROR} 是否可用。"
-        log_error "您也可以尝试直接从此链接下载: ${NODE_EXPORTER_DL_URL}"
-        exit 1
-    fi
-    tar xvf ${NODE_EXPORTER_FILENAME} > /dev/null
-    mv node_exporter-${NODE_EXPORTER_VERSION}.${ARCH} node_exporter
-    rm ${NODE_EXPORTER_FILENAME}
-    log_info "Node Exporter 已安装到 ${NODE_EXPORTER_DIR}"
+    log_info "正在下载 SHA256 校验和文件..."
+    curl --progress-bar -fLO "${GITHUB_MIRROR}/${SHA256_URL}" || log_error "SHA256SUM 文件下载失败。"
+    
+    log_info "正在校验 Node Exporter 文件完整性..."
+    grep "${NODE_EXPORTER_FILENAME}" sha256sums.txt | sha256sum -c - || log_error "Node Exporter 文件校验失败！"
+    
+    log_info "校验成功，正在安装 Node Exporter..."
+    tar xzf "${NODE_EXPORTER_FILENAME}" > /dev/null
+    mv "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}/node_exporter" /usr/local/bin/
+    rm -rf "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}"*
+    log_info "Node Exporter 已安装到 /usr/local/bin/"
+
+    # --- 设置权限 ---
+    log_info "正在设置目录权限..."
+    mkdir -p "${INSTALL_BASE_DIR}/data"
+    chown -R "${USER}:${GROUP}" "${INSTALL_BASE_DIR}"
 }
 
-
-# 4. 创建 Prometheus 配置文件
+# 6. 创建 Prometheus 配置文件
 create_prometheus_config() {
     log_info "正在创建 Prometheus 默认配置文件..."
-    # 使用 'EOF' 来防止变量替换，保持文件内容原样
-    cat > ${PROMETHEUS_DIR}/prometheus.yml << 'EOF'
-#====================================================================================
-# 全 局 配 置  (Global Settings)
-#====================================================================================
+    cat > "${INSTALL_BASE_DIR}/prometheus.yml" << 'EOF'
 global:
-  # 指 标 数 据 抓 取 频 率 。
-  scrape_interval: 10s
-  # 告 警 规 则 的 检 查 频 率 。
+  scrape_interval: 15s
   evaluation_interval: 15s
-  # 抓 取 超 时 时 间 。
-  scrape_timeout: 8s
-
-#====================================================================================
-# 告 警 管 理 器  (Alertmanager) 配 置
-#====================================================================================
-alerting:
-  alertmanagers:
-    # 这 里 定 义 了 Prometheus 要 将 触 发 的 告 警 发 送 到 哪 个 Alertmanager 实 例 。
-    - static_configs:
-        - targets:
-          # - alertmanager:9093 # Alertmanager 的 地 址 。 取 消 此 行 的 注 释 来 启 用 它 。
-
-#====================================================================================
-# 告 警 规 则 文 件 加 载
-#====================================================================================
-rule_files:
-  # Prometheus 会 从 这 里 加 载 告 警 规 则 的 .yml 文 件 。 可 以 有 多 个 。
-  # - "alert_rules.yml"
-  # - "another_rules.yml"
-
-#====================================================================================
-# 数 据 抓 取 配 置  (Scrape Configurations)
-#====================================================================================
 scrape_configs:
-  # --- 任 务 : 监 控 Prometheus 自 身 ---
   - job_name: 'prometheus'
-    # 任 务 名 (job_name) 会 作 为 一 个 标 签 (例 如 : job="prometheus")
-    # 添 加 到 所 有 从 这 个 任 务 抓 取 到 的 指 标 上 ， 方 便 后 续 查 询 和 筛 选 。
     static_configs:
-      # 监 控 目 标 的 地 址 列 表 。 这 里 是 监 控 Prometheus 自 己 。
-      - targets: [ 'localhost:9090' ]
-
-  # --- 任 务 : 监 控 服 务 器 硬 件 和 操 作 系 统 (Node Exporter) ---
+      - targets: ['localhost:9090']
   - job_name: 'node_exporter'
     static_configs:
-      # Node Exporter 通 常 运 行 在 9100 端 口 。
-      # 如 果 Prometheus 和 Node Exporter 都 在 宿 主 机 上 运 行 ， 则 使 用 'localhost:9100'。
-      - targets: [ 'localhost:9100' ]
+      - targets: ['localhost:9100']
 EOF
-    log_info "配置文件创建成功: ${PROMETHEUS_DIR}/prometheus.yml"
+    chown "${USER}:${GROUP}" "${INSTALL_BASE_DIR}/prometheus.yml"
+    log_info "配置文件创建成功: ${INSTALL_BASE_DIR}/prometheus.yml"
 }
 
-# 5. 配置 Supervisor
-configure_supervisor() {
-    log_info "正在配置 Supervisor..."
+# 7. 配置 Systemd 服务
+configure_systemd() {
+    log_info "正在配置 Systemd 服务..."
     
-    # Prometheus Supervisor 配置
-    cat > /etc/supervisor/conf.d/prometheus.conf << EOF
-[program:prometheus]
-command=${PROMETHEUS_DIR}/prometheus --config.file=${PROMETHEUS_DIR}/prometheus.yml
-directory=${PROMETHEUS_DIR}
-autostart=true
-autorestart=true
-user=root
-stopsignal=QUIT
-stdout_logfile=/var/log/supervisor/prometheus.log
-stderr_logfile=/var/log/supervisor/prometheus_err.log
+    cat > /etc/systemd/system/prometheus.service << EOF
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+[Service]
+User=${USER}
+Group=${GROUP}
+Type=simple
+ExecStart=${INSTALL_BASE_DIR}/prometheus \
+    --config.file=${INSTALL_BASE_DIR}/prometheus.yml \
+    --storage.tsdb.path=${INSTALL_BASE_DIR}/data/ \
+    --web.console.templates=${INSTALL_BASE_DIR}/consoles \
+    --web.console.libraries=${INSTALL_BASE_DIR}/console_libraries
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    # Node Exporter Supervisor 配置
-    cat > /etc/supervisor/conf.d/node_exporter.conf << EOF
-[program:node_exporter]
-command=${NODE_EXPORTER_DIR}/node_exporter
-directory=${NODE_EXPORTER_DIR}
-autostart=true
-autorestart=true
-user=root
-stdout_logfile=/var/log/supervisor/node_exporter.log
-stderr_logfile=/var/log/supervisor/node_exporter_err.log
+    cat > /etc/systemd/system/node_exporter.service << EOF
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+[Service]
+User=${USER}
+Group=${GROUP}
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    log_info "Supervisor 配置文件创建完成。"
-    log_info "正在重新加载 Supervisor 配置并启动服务..."
-    supervisorctl reread
-    supervisorctl update
-    supervisorctl start prometheus
-    supervisorctl start node_exporter
-    log_info "Prometheus 和 Node Exporter 已通过 Supervisor 启动。"
+    log_info "Systemd 配置文件创建完成。"
+    log_info "正在重新加载 Systemd 并启动服务..."
+    systemctl daemon-reload
+    systemctl enable --now prometheus
+    systemctl enable --now node_exporter
+    log_info "Prometheus 和 Node Exporter 已启动并设置为开机自启。"
 }
 
-# 6. 配置防火墙
+# 8. 配置防火墙
 configure_firewall() {
     log_info "开始配置防火墙 (UFW)..."
-
-    UFW_INSTALLED=false
-    if command -v ufw &> /dev/null; then
-        UFW_INSTALLED=true
+    if ! command -v ufw &> /dev/null; then
+        log_warn "未找到 ufw 命令，跳过防火墙配置。"
+        return
     fi
 
-    # 检查 ufw 是否已经激活
+    local UFW_ACTIVE
     UFW_ACTIVE=$(ufw status | grep -w "Status: active" || true)
 
-    if [ "$UFW_INSTALLED" = true ] && [ -n "$UFW_ACTIVE" ]; then
-        log_info "检测到 UFW 已安装并处于激活状态。将仅添加新规则。"
+    if [ -n "${UFW_ACTIVE}" ]; then
+        log_info "检测到 UFW 已激活，将仅添加新规则。"
     else
-        if [ "$UFW_INSTALLED" = false ]; then
-            log_warn "未检测到 UFW。脚本将为您安装 UFW。"
-            apt-get install -y ufw > /dev/null
-        fi
-
         log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 警告 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        log_warn "脚本将启用 UFW 防火墙。为防止服务器失联，请输入您需要保持开放"
-        log_warn "的端口 (例如 SSH 端口 22, Web 端口 80 443)。"
-        log_warn "多个端口请用空格隔开。如果留空，将只开放 SSH (22) 端口。"
+        log_warn "脚本将启用 UFW 防火墙。为防止服务器失联，请输入需要保持开放"
+        log_warn "的端口 (例如 SSH 端口 22)。多个端口请用空格隔开。"
+        log_warn "如果留空，将只开放 SSH (22) 端口。"
         log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         read -p "请输入需要保持开放的端口 (默认: 22): " essential_ports
 
-        # 如果用户没有输入，则默认开启 22 端口
-        if [ -z "$essential_ports" ]; then
-            essential_ports="22"
-            log_info "未输入端口，默认将开放 SSH 端口 22。"
-        fi
+        essential_ports=${essential_ports:-22}
+        log_info "将开放以下基础端口: ${essential_ports}"
 
-        for port in $essential_ports; do
-            ufw allow $port comment 'Essential service port'
-            log_info "已添加规则: 允许端口 ${port}"
+        for port in ${essential_ports}; do
+            ufw allow "${port}" comment 'Essential service port'
         done
     fi
 
-    # 获取用户输入的监控授权IP地址
-    read -p "请输入授权访问监控端口的 IP 地址 (单个IP或多个IP用空格隔开): " authorized_ips
+    read -p "请输入授权访问监控端口的 IP 地址 (留空则只允许本机访问): " authorized_ips
 
-    if [ -z "$authorized_ips" ]; then
-        log_warn "没有输入授权IP，将只允许从本地访问监控端口。"
-        ufw allow 9090/tcp comment 'Prometheus access (localhost only)'
-        ufw allow 9100/tcp comment 'Node Exporter access (localhost only)'
+    if [ -z "${authorized_ips}" ]; then
+        log_warn "没有输入授权IP，将只允许从本机 (localhost) 访问监控端口。"
+        ufw allow from 127.0.0.1 to any port 9090 proto tcp comment 'Prometheus access (localhost only)'
+        ufw allow from 127.0.0.1 to any port 9100 proto tcp comment 'Node Exporter access (localhost only)'
     else
         log_info "正在为以下 IP 授权端口 9090 和 9100: ${authorized_ips}"
-        for ip in $authorized_ips; do
-            ufw allow from ${ip} to any port 9090 proto tcp comment 'Prometheus access'
-            ufw allow from ${ip} to any port 9100 proto tcp comment 'Node Exporter access'
+        for ip in ${authorized_ips}; do
+            ufw allow from "${ip}" to any port 9090 proto tcp comment 'Prometheus access'
+            ufw allow from "${ip}" to any port 9100 proto tcp comment 'Node Exporter access'
         done
-        log_info "防火墙规则已添加。"
     fi
 
-    # 启用防火墙 (如果之前未启用)
-    if [ -z "$UFW_ACTIVE" ]; then
+    if [ -z "${UFW_ACTIVE}" ]; then
         ufw --force enable
         log_info "UFW 已启用。"
     fi
@@ -282,56 +276,162 @@ configure_firewall() {
     echo "--------------------"
 }
 
+# 9. 安装 starnode 管理工具
+install_starnode_cli() {
+    log_info "正在安装 starnode 管理工具..."
+    
+    # 使用 Here Document 将 starnode 脚本内容写入文件
+    cat > /usr/local/bin/starnode << 'EOF'
+#!/bin/bash
+# ==============================================================================
+# StarNode - Prometheus & Node Exporter 管理工具
+# ==============================================================================
 
-# 7. 打印最终报告
-print_report() {
-    # 获取服务器公网 IP
-    SERVER_IP=$(curl -s ifconfig.me)
-    if [ -z "$SERVER_IP" ]; then
-        SERVER_IP="<你的服务器IP>"
+set -u
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+SERVICES=("prometheus" "node_exporter")
+PROMETHEUS_INSTALL_DIR="/opt/prometheus"
+PROMETHEUS_USER="prometheus"
+SYSTEMD_FILES=("/etc/systemd/system/prometheus.service" "/etc/systemd/system/node_exporter.service")
+
+log_info() { echo -e "${GREEN}[INFO] $1${NC}"; }
+log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
+log_error() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
+
+check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        log_error "此操作需要 root 权限。请使用 'sudo starnode $1'。"
+    fi
+}
+
+usage() {
+    echo "StarNode - Prometheus & Node Exporter 管理工具"
+    echo "用法: starnode [命令]"
+    echo "-------------------------------------------------"
+    echo "  start      启动所有监控服务"
+    echo "  stop       停止所有监控服务"
+    echo "  restart    重启所有监控服务"
+    echo "  status     检查所有监控服务的状态"
+    echo "  uninstall  彻底卸载监控服务及其所有数据"
+}
+
+do_uninstall() {
+    check_root "uninstall"
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 警告 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+    log_warn "您即将执行彻底卸载操作。这将:"
+    log_warn "  1. 停止并禁用 Prometheus 和 Node Exporter 服务。"
+    log_warn "  2. 删除所有 Systemd 配置文件。"
+    log_warn "  3. 删除整个安装目录 (${PROMETHEUS_INSTALL_DIR})，包括所有监控数据！"
+    log_warn "  4. 删除专用的系统用户 '${PROMETHEUS_USER}'。"
+    log_warn "  5. 尝试移除相关的防火墙规则。"
+    log_warn "此操作不可逆！"
+    echo -e "${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
+    read -p "请输入 'uninstall' 以确认执行此操作: " confirmation
+
+    if [ "${confirmation}" != "uninstall" ]; then
+        log_info "操作已取消。"
+        exit 0
     fi
 
+    log_info "开始卸载流程..."
+    log_info "正在停止并禁用 Systemd 服务..."
+    systemctl disable --now "${SERVICES[@]}" &> /dev/null
+    log_info "正在删除 Systemd 配置文件..."
+    rm -f "${SYSTEMD_FILES[@]}"
+    systemctl daemon-reload
+    log_info "正在删除安装目录和二进制文件..."
+    rm -rf "${PROMETHEUS_INSTALL_DIR}"
+    rm -f /usr/local/bin/node_exporter
+    log_info "正在删除系统用户 '${PROMETHEUS_USER}'..."
+    userdel "${PROMETHEUS_USER}" &> /dev/null || log_warn "用户 '${PROMETHEUS_USER}' 可能已被手动删除。"
+    log_info "正在尝试移除 UFW 防火墙规则..."
+    if command -v ufw &> /dev/null; then
+        RULES_TO_DELETE=$(ufw status numbered | grep -E "Prometheus access|Node Exporter access" | awk -F'[][]' '{print $2}' | sort -nr)
+        if [ -n "$RULES_TO_DELETE" ]; then
+            for num in $RULES_TO_DELETE; do
+                yes | ufw delete "$num" > /dev/null && log_info "已删除 UFW 规则 #${num}"
+            done
+        else
+            log_warn "未找到相关的 UFW 规则。"
+        fi
+    else
+        log_warn "未找到 ufw 命令，跳过防火墙规则移除。"
+    fi
+    echo -e "\n${GREEN}=====================================================${NC}"
+    log_info "Prometheus 和 Node Exporter 已成功卸载。"
+    echo -e "${GREEN}=====================================================${NC}"
+}
+
+if [ $# -eq 0 ]; then usage; exit 1; fi
+COMMAND="$1"
+case "${COMMAND}" in
+    start) check_root "start"; systemctl start "${SERVICES[@]}"; log_info "服务已启动。";;
+    stop) check_root "stop"; systemctl stop "${SERVICES[@]}"; log_info "服务已停止。";;
+    restart) check_root "restart"; systemctl restart "${SERVICES[@]}"; log_info "服务已重启。";;
+    status) log_info "正在检查服务状态..."; systemctl status --no-pager "${SERVICES[@]}";;
+    uninstall) do_uninstall;;
+    *) log_error "未知命令: ${COMMAND}"; usage; exit 1;;
+esac
+EOF
+    
+    # 赋予执行权限
+    chmod +x /usr/local/bin/starnode
+    log_info "管理工具 'starnode' 已成功安装到 /usr/local/bin/"
+    log_info "您现在可以在系统的任何位置直接使用 'starnode' 命令。"
+}
+
+
+# 10. 打印最终报告
+print_report() {
+    local SERVER_IP
+    SERVER_IP=$(curl -s --fail --connect-timeout 2 ifconfig.me || hostname -I | awk '{print $1}')
+    [ -z "${SERVER_IP}" ] && SERVER_IP="<你的服务器IP>"
+
+    local prometheus_status node_exporter_status
+    prometheus_status=$(systemctl is-active prometheus)
+    node_exporter_status=$(systemctl is-active node_exporter)
+    
     echo -e "\n\n"
     echo -e "${GREEN}=====================================================${NC}"
     echo -e "${GREEN}      监控服务安装与配置完成！ 🎉      ${NC}"
     echo -e "${GREEN}=====================================================${NC}"
     echo -e "\n"
-    echo -e "✅ ${YELLOW}Prometheus 状态:${NC} $(supervisorctl status prometheus | awk '{print $2}')"
-    echo -e "✅ ${YELLOW}Node Exporter 状态:${NC} $(supervisorctl status node_exporter | awk '{print $2}')"
+    echo -e "✅ ${YELLOW}Prometheus 状态:${NC} ${prometheus_status}"
+    echo -e "✅ ${YELLOW}Node Exporter 状态:${NC} ${node_exporter_status}"
     echo -e "\n"
     log_info "服务详情:"
     echo -e "  - ${YELLOW}Prometheus Web UI:${NC} http://${SERVER_IP}:9090"
     echo -e "  - ${YELLOW}Node Exporter Metrics:${NC} http://${SERVER_IP}:9100/metrics"
-    echo -e "  - ${YELLOW}安装目录:${NC} ${INSTALL_DIR}"
-    echo -e "  - ${YELLOW}Supervisor 配置文件:${NC} /etc/supervisor/conf.d/"
+    echo -e "  - ${YELLOW}Prometheus 安装目录:${NC} ${INSTALL_BASE_DIR}"
+    echo -e "  - ${YELLOW}Systemd 配置文件:${NC} /etc/systemd/system/"
     echo -e "\n"
-    log_info "防火墙 (UFW) 规则摘要 (监控相关):"
-    ufw status | grep -E "9090|9100" || echo "  未找到监控相关规则或 UFW 未激活。"
+    log_info "全局管理工具:"
+    echo -e "  'starnode' 命令已安装到您的系统中。"
+    echo -e "  - 查看状态: ${YELLOW}starnode status${NC}"
+    echo -e "  - 停止服务: ${YELLOW}sudo starnode stop${NC}"
+    echo -e "  - 彻底卸载: ${YELLOW}sudo starnode uninstall${NC}"
     echo -e "\n"
     log_info "下一步操作:"
-    echo -e "  在您的 Grafana 服务器中，添加一个新的 Prometheus 数据源。"
-    echo -e "  使用以下地址进行连接:"
-    echo -e "  ${YELLOW}URL: http://${SERVER_IP}:9090${NC}"
-    echo -e "\n"
-    echo -e "${GREEN}=====================================================${NC}"
+    echo -e "  在您的 Grafana 中添加 Prometheus 数据源: ${YELLOW}URL: http://${SERVER_IP}:9090${NC}"
+    echo -e "\n${GREEN}=====================================================${NC}"
 }
-
 
 # --- 主程序 ---
 main() {
     clear
-    echo -e "${GREEN}欢迎使用 Prometheus & Node Exporter 自动化部署工具 v5${NC}"
-    echo -e "----------------------------------------------------"
+    echo -e "${GREEN}欢迎使用 Prometheus & Node Exporter 自动化部署工具${NC}"
+    echo "----------------------------------------------------"
     check_root
+    detect_distro_and_arch
+    create_service_user
     install_dependencies
     download_and_setup
     create_prometheus_config
-    configure_supervisor
+    configure_systemd
     configure_firewall
+    install_starnode_cli
     print_report
 }
 
 # 执行主函数
 main
-
-
