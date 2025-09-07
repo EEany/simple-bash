@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# Prometheus & Node Exporter 自动化安装脚本 (monitor.sh)
+# Prometheus & Node Exporter 自动化安装脚本 (monitor.sh v3)
 #
 # 功能:
 # 1. 检查并请求 Root 权限.
 # 2. 自动检测系统发行版 (Debian/Ubuntu/CentOS/RHEL) 和架构 (x86_64/arm64).
 # 3. 创建专用的低权限系统用户 'prometheus' 来运行服务，增强安全性.
 # 4. 安装必要的依赖 (ufw, curl).
-# 5. 从镜像下载 Prometheus 和 Node Exporter，并显示下载进度条.
+# 5. [新] 使用多个加速镜像轮询下载，并加入最多3次失败重试功能.
 # 6. 下载官方 SHA256 校验和文件，并验证软件包完整性.
 # 7. 解压并安装服务.
 # 8. 创建详细的默认 Prometheus 配置文件.
@@ -20,9 +20,7 @@
 # ==============================================================================
 
 # --- 脚本设置 ---
-# 在任何命令返回非零退出状态时立即退出
 set -e
-# 在引用未设置的变量时视为错误
 set -u
 
 # --- 全局变量 ---
@@ -31,13 +29,20 @@ NODE_EXPORTER_VERSION="1.8.2"
 INSTALL_BASE_DIR="/opt/prometheus"
 USER="prometheus"
 GROUP="prometheus"
-GITHUB_MIRROR="https://ghfast.top"
+
+# [更新] 使用您提供的最新 GitHub 加速镜像列表
+GITHUB_MIRRORS=(
+    "https://gh-proxy.com"
+    "https://hk.gh-proxy.com"
+    "https://cdn.gh-proxy.com"
+    "https://edgeone.gh-proxy.com"
+)
 
 # --- 颜色定义 ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # --- 函数定义 ---
 
@@ -47,6 +52,45 @@ log_error() {
     echo -e "${RED}[ERROR] $1${NC}"
     exit 1
 }
+
+# 带重试和轮询功能的下载函数
+# 参数1: 原始 GitHub 下载 URL
+# 参数2: 保存的文件名
+download_with_retry() {
+    local original_url="$1"
+    local output_filename="$2"
+    local max_attempts=3
+    local attempt=1
+    local success=false
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        # 通过取余运算实现镜像轮询
+        local mirror_index=$(( (attempt - 1) % ${#GITHUB_MIRRORS[@]} ))
+        local mirror_host="${GITHUB_MIRRORS[$mirror_index]}"
+        local full_url="${mirror_host}/${original_url}"
+
+        log_info "尝试下载 (第 ${attempt}/${max_attempts} 次) 从: ${mirror_host}"
+        
+        # 使用 -o 指定输出文件名，因为 URL 结构变了
+        if curl --progress-bar -fL -o "${output_filename}" "${full_url}"; then
+            log_info "下载成功。"
+            success=true
+            break
+        else
+            log_warn "从 ${mirror_host} 下载失败。"
+            if [ "$attempt" -lt "$max_attempts" ]; then
+                log_warn "将在2秒后尝试下一个镜像..."
+                sleep 2
+            fi
+        fi
+        ((attempt++))
+    done
+
+    if [ "$success" = false ]; then
+        log_error "所有下载尝试均失败。请检查您的网络连接或镜像可用性。"
+    fi
+}
+
 
 # 1. 检查 Root 权限
 check_root() {
@@ -60,7 +104,6 @@ check_root() {
 # 2. 检测系统发行版和架构
 detect_distro_and_arch() {
     log_info "正在检测系统环境..."
-    # 检测架构
     MACHINE_ARCH=$(uname -m)
     case "${MACHINE_ARCH}" in
         x86_64) ARCH="linux-amd64" ;;
@@ -69,7 +112,6 @@ detect_distro_and_arch() {
     esac
     log_info "检测到系统架构: ${ARCH}"
 
-    # 检测包管理器
     if command -v apt-get &> /dev/null; then
         PKG_MANAGER="apt-get"
         INSTALL_CMD="apt-get install -y"
@@ -112,46 +154,48 @@ download_and_setup() {
     log_info "正在创建安装目录: ${INSTALL_BASE_DIR}"
     rm -rf "${INSTALL_BASE_DIR}"
     mkdir -p "${INSTALL_BASE_DIR}"
-    cd "${INSTALL_BASE_DIR}"
-
+    
     # --- 处理 Prometheus ---
+    cd "${INSTALL_BASE_DIR}"
     local PROMETHEUS_FILENAME="prometheus-${PROMETHEUS_VERSION}.${ARCH}.tar.gz"
     local PROMETHEUS_DL_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${PROMETHEUS_FILENAME}"
+    local SHA256_FILENAME="prometheus-sha256sums.txt" # Use a unique name
     local SHA256_URL="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/sha256sums.txt"
 
     log_info "正在下载 Prometheus (v${PROMETHEUS_VERSION})..."
-    curl --progress-bar -fLO "${GITHUB_MIRROR}/${PROMETHEUS_DL_URL}" || log_error "Prometheus 下载失败。"
+    download_with_retry "${PROMETHEUS_DL_URL}" "${PROMETHEUS_FILENAME}"
     
-    log_info "正在下载 SHA256 校验和文件..."
-    curl --progress-bar -fLO "${GITHUB_MIRROR}/${SHA256_URL}" || log_error "SHA256SUM 文件下载失败。"
+    log_info "正在下载 Prometheus SHA256 校验和文件..."
+    download_with_retry "${SHA256_URL}" "${SHA256_FILENAME}"
     
     log_info "正在校验 Prometheus 文件完整性..."
-    grep "${PROMETHEUS_FILENAME}" sha256sums.txt | sha256sum -c - || log_error "Prometheus 文件校验失败！文件可能已损坏或被篡改。"
+    grep "${PROMETHEUS_FILENAME}" "${SHA256_FILENAME}" | sha256sum --check --strict || log_error "Prometheus 文件校验失败！"
     
     log_info "校验成功，正在解压 Prometheus..."
     tar xzf "${PROMETHEUS_FILENAME}" --strip-components=1 -C "${INSTALL_BASE_DIR}" > /dev/null
-    rm -f "${PROMETHEUS_FILENAME}" sha256sums.txt
+    rm -f "${PROMETHEUS_FILENAME}" "${SHA256_FILENAME}"
     log_info "Prometheus 已安装到 ${INSTALL_BASE_DIR}"
 
     # --- 处理 Node Exporter ---
+    cd /tmp
     local NODE_EXPORTER_FILENAME="node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
     local NODE_EXPORTER_DL_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_FILENAME}"
+    SHA256_FILENAME="node-exporter-sha256sums.txt" # Use a unique name
     SHA256_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/sha256sums.txt"
     
-    cd /tmp
     log_info "正在下载 Node Exporter (v${NODE_EXPORTER_VERSION})..."
-    curl --progress-bar -fLO "${GITHUB_MIRROR}/${NODE_EXPORTER_DL_URL}" || log_error "Node Exporter 下载失败。"
+    download_with_retry "${NODE_EXPORTER_DL_URL}" "${NODE_EXPORTER_FILENAME}"
 
-    log_info "正在下载 SHA256 校验和文件..."
-    curl --progress-bar -fLO "${GITHUB_MIRROR}/${SHA256_URL}" || log_error "SHA256SUM 文件下载失败。"
+    log_info "正在下载 Node Exporter SHA256 校验和文件..."
+    download_with_retry "${SHA256_URL}" "${SHA256_FILENAME}"
     
     log_info "正在校验 Node Exporter 文件完整性..."
-    grep "${NODE_EXPORTER_FILENAME}" sha256sums.txt | sha256sum -c - || log_error "Node Exporter 文件校验失败！"
+    grep "${NODE_EXPORTER_FILENAME}" "${SHA256_FILENAME}" | sha256sum --check --strict || log_error "Node Exporter 文件校验失败！"
     
     log_info "校验成功，正在安装 Node Exporter..."
     tar xzf "${NODE_EXPORTER_FILENAME}" > /dev/null
     mv "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}/node_exporter" /usr/local/bin/
-    rm -rf "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}"*
+    rm -rf "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}"* "${SHA256_FILENAME}"
     log_info "Node Exporter 已安装到 /usr/local/bin/"
 
     # --- 设置权限 ---
@@ -159,6 +203,7 @@ download_and_setup() {
     mkdir -p "${INSTALL_BASE_DIR}/data"
     chown -R "${USER}:${GROUP}" "${INSTALL_BASE_DIR}"
 }
+
 
 # 6. 创建 Prometheus 配置文件
 create_prometheus_config() {
@@ -280,7 +325,6 @@ configure_firewall() {
 install_starnode_cli() {
     log_info "正在安装 starnode 管理工具..."
     
-    # 使用 Here Document 将 starnode 脚本内容写入文件
     cat > /usr/local/bin/starnode << 'EOF'
 #!/bin/bash
 # ==============================================================================
@@ -374,7 +418,6 @@ case "${COMMAND}" in
 esac
 EOF
     
-    # 赋予执行权限
     chmod +x /usr/local/bin/starnode
     log_info "管理工具 'starnode' 已成功安装到 /usr/local/bin/"
     log_info "您现在可以在系统的任何位置直接使用 'starnode' 命令。"
